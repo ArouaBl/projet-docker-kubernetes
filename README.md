@@ -1,83 +1,61 @@
-# TP — Conteneurisation & Orchestration (Docker Compose → Kubernetes/Minikube)
+# TP — Conteneurisation et Orchestration (Docker Compose puis Kubernetes/Minikube)
 
-Application micro-services : **Frontend** (nginx) → **API** (Node.js/Express) → **Redis** (persistant).
+Application micro-services : **frontend** (nginx), **API** (Node.js/Express) et **Redis** (persistant).
 
-```
-Navigateur ──8080──► frontend (nginx) ──/api/──► api (x N réplicas) ──► redis (volume)
-```
+    Navigateur --> frontend (nginx) --/api/--> api (N réplicas) --> redis (volume)
 
-## 1. Prérequis
-Docker ≥ 24, Docker Compose v2, Minikube, kubectl.
+## Prérequis
+Docker Desktop, Minikube, kubectl. Sous Windows, utiliser Git Bash.
 
-## 2. Partie 1 — Docker & Compose
+## Partie 1 : Docker Compose
 ```bash
 docker compose up -d --build
-docker compose ps                  # api, redis -> "healthy"
-open http://localhost:8080
+docker compose ps
 ```
-**Persistance** : `docker compose down && docker compose up -d` → les tâches sont conservées (volume `redis-data`).
-`docker compose down -v` supprime les données.
+Application : http://localhost:8081
 
-**Choix techniques (Dockerfile)**
-| Choix | Justification |
-|---|---|
-| Multi-stage sur l'API (`deps` → image finale) | Aucun outil de build/cache npm dans l'image finale |
-| Images `alpine` | Taille réduite (≈ 150 Mo API, ≈ 50 Mo front) |
-| `USER node` / nginx-unprivileged | Pas d'exécution en root |
-| `.dockerignore`, `npm cache clean` | Contexte et couches allégés |
-| `HEALTHCHECK` | Permet `depends_on: service_healthy` |
-| `COPY package.json` avant le code | Cache de couches optimal |
+Arrêt : `docker compose down` (les données sont gardées dans le volume `redis-data`).
 
-**Réseau** : deux réseaux. `front-net` (frontend↔api) et `back-net` (`internal: true`, api↔redis). Redis n'est joignable ni de l'extérieur ni du frontend. La résolution DNS se fait par nom de service (`api`, `redis`).
-
-Mesurer : `docker images | grep tp/`
-
-## 3. Partie 2 — Kubernetes (Minikube)
+## Partie 2 : Kubernetes avec Minikube
+Arrêter d'abord Compose (`docker compose down`), puis :
 ```bash
-./deploy-minikube.sh               # start, build dans Minikube, apply, URL finale
+bash deploy-minikube.sh
 kubectl -n tp-conteneurs get all,pvc
 ```
-| Fichier | Contenu |
-|---|---|
-| `00-namespace.yaml` | Namespace `tp-conteneurs` |
-| `10-redis.yaml` | PVC 1 Gi + Deployment (strategy Recreate) + Service ClusterIP |
-| `20-api.yaml` | ConfigMap, Deployment (2 réplicas, probes liveness/readiness, limits), Service, HPA |
-| `30-frontend.yaml` | Deployment (2 réplicas) + Service NodePort 30080 |
-
-Le même `nginx.conf` marche en Compose et en K8s car le Service s'appelle `api` dans les deux cas.
+Accès à l'application (laisser ce terminal ouvert) :
+```bash
+kubectl -n tp-conteneurs port-forward svc/frontend 8081:8080
+```
+Puis ouvrir http://localhost:8081
 
 ### Test de scalabilité
 ```bash
-./test-scalabilite.sh
-# ou manuellement :
 kubectl -n tp-conteneurs scale deploy/api --replicas=5
-for i in $(seq 10); do curl -s $(minikube service frontend -n tp-conteneurs --url)/api/info; echo; done
+kubectl -n tp-conteneurs get pods -l app=api
+kubectl -n tp-conteneurs run test --rm -it --image=busybox --restart=Never -- sh
+# dans le pod :
+for i in $(seq 10); do wget -qO- http://api:3000/api/info; echo; done
 ```
-Le champ `served_by` change d'un appel à l'autre : le Service répartit la charge entre pods.
-Test HPA : `kubectl -n tp-conteneurs get hpa -w` pendant une charge (`hey`, `ab`, ou boucle `curl`).
+Le champ `served_by` change : le Service répartit les requêtes entre les pods.
+Retour à 2 réplicas : `kubectl -n tp-conteneurs scale deploy/api --replicas=2`.
 
-### Tests de résilience / persistance
-- Supprimer un pod API → le Deployment en recrée un, sans coupure (2+ réplicas).
-- `kubectl rollout restart deploy/redis` → les données persistent grâce au PVC.
+Le script `bash test-scalabilite.sh` enchaîne scalabilité, résilience et persistance.
 
-## 4. Docker Compose vs Kubernetes
-| | Compose | Kubernetes |
-|---|---|---|
-| Scalabilité | `--scale api=3` (manuel, 1 hôte) | `replicas`, HPA automatique |
-| Auto-guérison | `restart:` basique | Probes + recréation de pods |
-| Mises à jour | Arrêt/relance | Rolling update |
-| Réseau | Réseaux bridge + DNS | Services, ClusterIP/NodePort/Ingress |
-| Données | Volumes nommés | PV/PVC, StorageClass |
-| Usage | Dev local | Production, multi-nœuds |
+### Test de persistance
+```bash
+kubectl -n tp-conteneurs rollout restart deploy/redis
+kubectl -n tp-conteneurs rollout status deploy/redis
+```
+Les tâches sont conservées grâce au PersistentVolumeClaim `redis-pvc`.
 
-## 5. Local vs Cloud
-Les manifestes sont portables vers EKS/GKE/AKS : seuls changent le registre d'images (supprimer `imagePullPolicy: Never`, pousser vers un registre), le Service frontend (`LoadBalancer` ou Ingress) et la StorageClass.
+## Contenu du dépôt
+- `api/` et `frontend/` : code et Dockerfile (multi-stage pour l'API, utilisateur non-root)
+- `docker-compose.yml` : 3 services, 2 réseaux (`back-net` interne), 1 volume
+- `k8s/` : namespace, Deployments, Services, ConfigMap, PVC, HPA
+- `deploy-minikube.sh`, `test-scalabilite.sh` : scripts de déploiement et de test
 
-## 6. Limites & améliorations
-Redis à instance unique (→ StatefulSet/Sentinel), pas de TLS/Ingress, pas de Secrets (Redis sans mot de passe), pas de CI/CD.
-
-## 7. Questions probables en démo
-1. Différence VM / conteneur ? (noyau partagé, namespaces + cgroups)
-2. Pourquoi multi-stage ? 3. Pod vs Deployment vs Service ?
-4. Que se passe-t-il si un pod meurt ? 5. Pourquoi `Recreate` pour Redis ?
-6. Liveness vs readiness ? 7. Comment passer en cloud ?
+## Nettoyage
+```bash
+kubectl delete -f k8s/
+minikube stop
+```
